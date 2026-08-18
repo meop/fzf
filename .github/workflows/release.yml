@@ -74,3 +74,37 @@ jobs:
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
           MACOS_NOTARY_KEY_ID:    ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_KEY:       ${{ secrets.MACOS_NOTARY_KEY }}
+
+      # Real per-machine Windows installers (.msi), alongside the existing
+      # portable .zip. Without this, winget only has a `portable` installer
+      # to offer, which it installs via a symlink into the WinGet Links
+      # folder -- and Windows blocks following symlinks over SSH by default,
+      # breaking fzf's shell integration in remote/non-interactive sessions.
+      # Built with the WiX v4/v5 dotnet-tool CLI since this is a Go project
+      # (no cargo-wix). WiX's -arch flag only supports x86/x64/arm64, so
+      # armv7 has no MSI counterpart here.
+      - name: Install WiX
+        if: github.event_name == 'push'
+        run: dotnet tool install --global wix
+
+      - name: Build Windows MSI installers
+        if: github.event_name == 'push'
+        run: |
+          set -e
+          V='${{ steps.ver.outputs.version }}'
+          for pair in "amd64:x64" "arm64:arm64"; do
+            goarch="${pair%%:*}"
+            wixarch="${pair##*:}"
+            bindir=$(dirname "$(find dist -type f -iname fzf.exe -path "*windows_${goarch}*" | head -n1)")
+            if [ -z "$bindir" ]; then
+              echo "No windows/${goarch} build found under dist/, skipping" >&2
+              continue
+            fi
+            wix build wix/main.wxs -arch "$wixarch" -d Version="$V" -d BinDir="$bindir" -o "dist/fzf-${V}-windows_${goarch}.msi"
+          done
+
+      - name: Upload MSI installers to release
+        if: github.event_name == 'push'
+        run: gh release upload "v${{ steps.ver.outputs.version }}" dist/*.msi --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
