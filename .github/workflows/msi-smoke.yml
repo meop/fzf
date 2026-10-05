@@ -1,0 +1,128 @@
+# Fork-only: build the Windows MSIs the way release.yml does (goreleaser on
+# macos-latest, then WiX in a Windows job), then install each on a matching
+# Windows runner.
+name: msi-smoke
+
+on:
+  push:
+    branches: [winget-wix-smoke]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Version from CHANGELOG.md
+        id: ver
+        run: echo "version=$(sed -n 4p CHANGELOG.md)" >> "$GITHUB_OUTPUT"
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: latest
+          args: build --snapshot --clean
+      # As in release.yml:
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-binaries
+          path: |
+            dist/*windows_amd64*/fzf.exe
+            dist/*windows_arm64*/fzf.exe
+          if-no-files-found: error
+
+  # The msi job's steps from release.yml, minus the release upload.
+  msi:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-binaries
+          path: dist
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Build Windows MSI installers
+        shell: bash
+        run: |
+          set -e
+          V='${{ needs.build.outputs.version }}'
+          for pair in "amd64:x64" "arm64:arm64"; do
+            goarch="${pair%%:*}"
+            wixarch="${pair##*:}"
+            bindir=$(dirname "$(find dist -type f -iname fzf.exe -path "*windows_${goarch}*" | head -n1)")
+            wix build wix/main.wxs -arch "$wixarch" -d Version="$V" -d BinDir="$bindir" -o "dist/fzf-${V}-windows_${goarch}.msi"
+          done
+          ls -la dist/*.msi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: msi
+          path: dist/*.msi
+
+  install-test:
+    needs: msi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            goarch: amd64
+            machine: 0x8664
+          - os: windows-11-arm
+            goarch: arm64
+            machine: 0xAA64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: msi
+      - name: Install, check, and uninstall the MSI
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem "*-windows_${{ matrix.goarch }}.msi" | Select-Object -First 1).FullName
+          "msi: $msi"
+          function Invoke-Msi($verb, $log) {
+            $p = Start-Process msiexec -ArgumentList "$verb `"$msi`" /qn /l*v $log" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "msiexec $verb failed: $($p.ExitCode)" }
+          }
+          Invoke-Msi '/i' install.log
+          $exe = Join-Path $env:ProgramFiles 'fzf\bin\fzf.exe'
+          if (-not (Test-Path $exe)) { throw "not installed at $exe" }
+          if ((Get-Item $exe).LinkType) { throw 'fzf.exe is a link, not a file' }
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $machine = [BitConverter]::ToUInt16($bytes, [BitConverter]::ToInt32($bytes, 0x3C) + 4)
+          "PE machine: 0x{0:X4}" -f $machine
+          if ($machine -ne ${{ matrix.machine }}) { throw 'unexpected PE machine type' }
+          # A new session (SSH included) gets the machine PATH: resolve fzf through it alone.
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machinePath -notlike '*\fzf\bin*') { throw 'fzf\bin is not on the machine PATH' }
+          $env:Path = $machinePath
+          (Get-Command fzf).Source
+          fzf --version
+          if ($LASTEXITCODE -ne 0) { throw 'fzf --version failed' }
+          # Over SSH, as the problem shows up there.
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null }
+          Start-Service sshd
+          $key = Join-Path $env:TEMP 'smoke_ed25519'
+          cmd /c ('ssh-keygen -q -t ed25519 -N "" -f "{0}"' -f $key)
+          $auth = 'C:\ProgramData\ssh\administrators_authorized_keys'
+          Get-Content "$key.pub" | Set-Content $auth -Encoding ascii
+          icacls $auth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          ssh -i $key -o StrictHostKeyChecking=no -o BatchMode=yes "$env:USERNAME@localhost" 'fzf --version'
+          if ($LASTEXITCODE -ne 0) { throw 'fzf failed over SSH after the MSI install' }
+          Invoke-Msi '/x' uninstall.log
+          if (Test-Path $exe) { throw 'fzf.exe remains after uninstall' }
+          if ([Environment]::GetEnvironmentVariable('Path', 'Machine') -like '*\fzf\bin*') { throw 'PATH entry remains after uninstall' }
+          'install, PATH lookup, SSH, and uninstall OK'
